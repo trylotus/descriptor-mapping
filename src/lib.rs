@@ -17,6 +17,7 @@ use prost_reflect_build::Builder;
 use proto::decode_file_descriptor_protos;
 use reqwest::StatusCode;
 use serde::Deserialize;
+use tokio::sync::mpsc;
 
 use crate::utils::base64a;
 
@@ -154,9 +155,12 @@ impl DescriptorMapping {
     }
 
     /// Periodically synchronize local mapping from remote registry.
-    pub fn sync_from_registry(&self, url: &str, sync_interval: Duration) {
+    /// Return after the first successful synchronization.
+    pub async fn sync_from_registry(&self, url: &str, sync_interval: Duration) {
         let url = url.to_string();
         let this = self.clone();
+
+        let (tx, mut rx) = mpsc::channel(1);
 
         tokio::spawn(async move {
             let mut ts: Option<i64> = None;
@@ -177,12 +181,18 @@ impl DescriptorMapping {
                                 ts = Some(last_updated);
                             }
                         };
+                        if !tx.is_closed() {
+                            let _ = tx.send(true).await;
+                            tx.closed().await;
+                        }
                     }
                 };
 
                 interval.tick().await;
             }
         });
+
+        rx.recv().await;
     }
 
     /// Get the descriptor for a given key.
