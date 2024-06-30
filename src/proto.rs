@@ -4,6 +4,8 @@ use prost_reflect::{
     DescriptorPool, FileDescriptor, ReflectMessage,
 };
 
+use crate::lotus;
+
 fn well_known_types() -> Vec<FileDescriptorProto> {
     Vec::from([Timestamp::default()
         .descriptor()
@@ -22,6 +24,9 @@ pub fn decode_file_descriptor_protos(files: Vec<Vec<u8>>) -> anyhow::Result<Vec<
 
     let mut pool = DescriptorPool::new();
     pool.add_file_descriptor_protos(well_known_types())?;
+    for file in lotus::DESCRIPTOR_POOL.files() {
+        pool.add_file_descriptor_proto(file.file_descriptor_proto().clone())?;
+    }
     pool.add_file_descriptor_protos(fdps)?;
 
     let mut fds = Vec::<FileDescriptor>::new();

@@ -1,10 +1,11 @@
+mod lotus;
 mod proto;
 mod utils;
 
 use std::{
     collections::HashMap,
     env,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, RwLock},
     time::Duration,
 };
@@ -24,8 +25,14 @@ pub fn compile_protos(
     protos: &[impl AsRef<Path>],
     includes: &[impl AsRef<Path>],
 ) -> anyhow::Result<()> {
+    let file_descriptor_set_path = env::var_os("OUT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("local_file_descriptor_set.bin");
+
     Builder::new()
         .descriptor_pool("crate::DESCRIPTOR_POOL")
+        .file_descriptor_set_path(file_descriptor_set_path)
         .compile_protos(protos, includes)?;
 
     Ok(())
@@ -74,7 +81,7 @@ impl DescriptorMapping {
     where
         P: AsRef<Path>,
     {
-        let pool_bin = std::fs::read(env::var("OUT_DIR")? + "/file_descriptor_set.bin")?;
+        let pool_bin = std::fs::read(env::var("OUT_DIR")? + "/local_file_descriptor_set.bin")?;
         let pool = DescriptorPool::decode(pool_bin.as_ref())?;
 
         for md in pool.all_messages() {
