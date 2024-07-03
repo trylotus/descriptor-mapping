@@ -1,14 +1,9 @@
-use std::{env, path::PathBuf};
-
 fn main() {
-    let file_descriptor_set_path = env::var_os("OUT_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("lotus_file_descriptor_set.bin");
-
-    prost_reflect_build::Builder::new()
-        .descriptor_pool("crate::lotus::DESCRIPTOR_POOL")
-        .file_descriptor_set_path(file_descriptor_set_path)
-        .compile_protos(&["proto/lotus.proto"], &["proto"])
-        .expect("Failed to compile protos");
+    protobuf_codegen::Codegen::new()
+        .protoc()
+        .protoc_path(&protoc_bin_vendored::protoc_bin_path().unwrap())
+        .include("proto")
+        .input("proto/lotus.proto")
+        .out_dir("src/proto")
+        .run_from_script();
 }

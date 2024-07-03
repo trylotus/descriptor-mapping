@@ -1,47 +1,37 @@
-mod lotus;
 mod proto;
 mod utils;
 
 use std::{
     collections::HashMap,
-    env,
-    path::{Path, PathBuf},
     sync::{Arc, RwLock},
     time::Duration,
 };
 
 use anyhow::anyhow;
 use bytes::Buf;
-use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
-use prost_reflect_build::Builder;
-use proto::decode_file_descriptor_protos;
+use once_cell::sync::Lazy;
+use proto::lotus;
+use protobuf::{
+    descriptor::FileDescriptorProto,
+    reflect::{FileDescriptor, MessageDescriptor},
+    Message, MessageDyn,
+};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use crate::utils::base64a;
 
-/// Compile protobuf files that will be loaded into the mapping later.
-pub fn compile_protos(
-    protos: &[impl AsRef<Path>],
-    includes: &[impl AsRef<Path>],
-) -> anyhow::Result<()> {
-    let file_descriptor_set_path = env::var_os("OUT_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("local_file_descriptor_set.bin");
-
-    Builder::new()
-        .descriptor_pool("crate::DESCRIPTOR_POOL")
-        .file_descriptor_set_path(file_descriptor_set_path)
-        .compile_protos(protos, includes)?;
-
-    Ok(())
-}
+static PROTO_DEPENDENCIES: Lazy<Vec<FileDescriptor>> = Lazy::new(|| {
+    vec![
+        protobuf::well_known_types::timestamp::file_descriptor().clone(),
+        lotus::file_descriptor().clone(),
+    ]
+});
 
 /// A mapping from string key to protobuf descriptor.
 pub struct DescriptorMapping {
-    mapping: Arc<RwLock<HashMap<String, MessageDescriptor>>>,
+    mapping: Arc<RwLock<HashMap<String, Arc<MessageDescriptor>>>>,
 }
 
 impl Clone for DescriptorMapping {
@@ -75,34 +65,6 @@ impl DescriptorMapping {
         }
     }
 
-    /// Load compiled protobuf into the mapping.
-    ///
-    /// Provide the path to a json file mapping from descriptor key to message name.
-    pub fn load_from_local<P>(&self, path: P) -> anyhow::Result<()>
-    where
-        P: AsRef<Path>,
-    {
-        let pool_bin = std::fs::read(env::var("OUT_DIR")? + "/local_file_descriptor_set.bin")?;
-        let pool = DescriptorPool::decode(pool_bin.as_ref())?;
-
-        for md in pool.all_messages() {
-            tracing::debug!("Load descriptor: {}", md.full_name());
-        }
-
-        let key_mapping_json = std::fs::read(path)?;
-        let key_mapping: HashMap<String, String> = serde_json::from_slice(&key_mapping_json)?;
-
-        for (key, msg_name) in key_mapping {
-            if let Some(md) = pool.get_message_by_name(&msg_name) {
-                self.add(key, md);
-            } else {
-                tracing::error!("Unknown message: {}", msg_name);
-            }
-        }
-
-        Ok(())
-    }
-
     /// Fetch descriptor mapping from remote registry.
     pub async fn fetch_from_registry(
         &self,
@@ -123,11 +85,12 @@ impl DescriptorMapping {
                 let resp_bytes = resp.bytes().await?.to_vec();
                 let resp_body: FetchResponseBody = serde_json::from_slice(&resp_bytes)?;
 
-                for d in resp_body.data {
-                    let fds = decode_file_descriptor_protos(d.files)?;
-                    let mut mapping = Vec::<(String, MessageDescriptor)>::new();
+                let mut mapping = Vec::<(String, MessageDescriptor)>::new();
 
-                    for fd in fds {
+                for d in resp_body.data {
+                    for file in d.files {
+                        let fdp = FileDescriptorProto::parse_from_bytes(&file)?;
+                        let fd = FileDescriptor::new_dynamic(fdp, &PROTO_DEPENDENCIES)?;
                         for md in fd.messages() {
                             let key = format!(
                                 "{}.{}.{}.{}",
@@ -139,9 +102,9 @@ impl DescriptorMapping {
                             mapping.push((key, md));
                         }
                     }
-
-                    self.add_many(mapping);
                 }
+
+                self.add_many(mapping);
 
                 Ok(Some(resp_body.last_updated))
             }
@@ -154,7 +117,7 @@ impl DescriptorMapping {
         }
     }
 
-    /// Periodically synchronize local mapping from remote registry.
+    /// Periodically synchronize mapping from remote registry.
     /// Return after the first successful synchronization.
     pub async fn sync_from_registry(&self, url: &str, sync_interval: Duration) {
         let url = url.to_string();
@@ -196,7 +159,7 @@ impl DescriptorMapping {
     }
 
     /// Get the descriptor for a given key.
-    pub fn get(&self, key: &str) -> Option<MessageDescriptor> {
+    pub fn get(&self, key: &str) -> Option<Arc<MessageDescriptor>> {
         let mapping = self.mapping.read().unwrap();
         mapping.get(key).cloned()
     }
@@ -204,7 +167,7 @@ impl DescriptorMapping {
     /// Add the descriptor for a given key.
     pub fn add(&self, key: String, md: MessageDescriptor) {
         let mut mapping = self.mapping.write().unwrap();
-        mapping.insert(key, md);
+        mapping.insert(key, Arc::new(md));
     }
 
     /// Add a list of key and descriptor pairs.
@@ -212,17 +175,17 @@ impl DescriptorMapping {
         let mut mapping = self.mapping.write().unwrap();
         for (key, md) in mds {
             tracing::info!("Add mapping: {} -> {}", key, md.full_name());
-            mapping.insert(key, md);
+            mapping.insert(key, Arc::new(md));
         }
     }
 
     /// Decode a message given the descriptor key.
-    pub fn decode<B>(&self, key: &str, buf: B) -> anyhow::Result<DynamicMessage>
+    pub fn decode<B>(&self, key: &str, bytes: &[u8]) -> anyhow::Result<Box<dyn MessageDyn>>
     where
         B: Buf,
     {
         if let Some(md) = self.get(key) {
-            let msg = DynamicMessage::decode(md, buf)?;
+            let msg = md.parse_from_bytes(bytes)?;
             Ok(msg)
         } else {
             Err(anyhow!("Key not found: {}", key))
