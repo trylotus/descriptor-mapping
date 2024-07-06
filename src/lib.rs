@@ -1,4 +1,3 @@
-mod proto;
 mod utils;
 
 use std::{
@@ -10,7 +9,6 @@ use std::{
 use anyhow::anyhow;
 use bytes::Buf;
 use once_cell::sync::Lazy;
-use proto::lotus;
 use protobuf::{
     descriptor::FileDescriptorProto,
     reflect::{FileDescriptor, MessageDescriptor},
@@ -25,7 +23,7 @@ use crate::utils::base64a;
 static PROTO_DEPENDENCIES: Lazy<Vec<FileDescriptor>> = Lazy::new(|| {
     vec![
         protobuf::well_known_types::timestamp::file_descriptor().clone(),
-        lotus::file_descriptor().clone(),
+        lotus_proto::lotus::file_descriptor().clone(),
     ]
 });
 
