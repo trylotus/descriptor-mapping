@@ -7,7 +7,6 @@ use std::{
 };
 
 use anyhow::anyhow;
-use bytes::Buf;
 use once_cell::sync::Lazy;
 use protobuf::{
     descriptor::FileDescriptorProto,
@@ -178,10 +177,7 @@ impl DescriptorMapping {
     }
 
     /// Decode a message given the descriptor key.
-    pub fn decode<B>(&self, key: &str, bytes: &[u8]) -> anyhow::Result<Box<dyn MessageDyn>>
-    where
-        B: Buf,
-    {
+    pub fn decode(&self, key: &str, bytes: &[u8]) -> anyhow::Result<Box<dyn MessageDyn>> {
         if let Some(md) = self.get(key) {
             let msg = md.parse_from_bytes(bytes)?;
             Ok(msg)
