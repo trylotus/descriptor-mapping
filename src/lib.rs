@@ -115,7 +115,8 @@ impl DescriptorMapping {
     }
 
     /// Periodically synchronize mapping from remote registry.
-    /// Return after the first successful synchronization.
+    ///
+    /// This function unblocks after the first successful synchronization.
     pub async fn sync_from_registry(&self, url: &str, sync_interval: Duration) {
         let url = url.to_string();
         let this = self.clone();
@@ -153,6 +154,12 @@ impl DescriptorMapping {
         });
 
         rx.recv().await;
+    }
+
+    /// Return all keys.
+    pub fn keys(&self) -> Vec<String> {
+        let mapping = self.mapping.read().unwrap();
+        mapping.keys().cloned().collect()
     }
 
     /// Get the descriptor for a given key.
