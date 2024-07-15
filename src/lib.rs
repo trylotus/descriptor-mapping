@@ -16,6 +16,7 @@ use protobuf::{
 use reqwest::StatusCode;
 use serde::Deserialize;
 use tokio::sync::mpsc;
+use tracing::{debug, error, info};
 
 use crate::utils::base64a;
 
@@ -39,21 +40,6 @@ impl Clone for DescriptorMapping {
     }
 }
 
-#[derive(Deserialize)]
-struct FetchResponseBody {
-    last_updated: i64,
-    data: Vec<Descriptor>,
-}
-
-#[derive(Deserialize)]
-struct Descriptor {
-    author: String,
-    connector: String,
-    version: String,
-    #[serde(with = "base64a")]
-    files: Vec<Vec<u8>>,
-}
-
 impl DescriptorMapping {
     /// Create a descriptor mapping.
     pub fn new() -> Self {
@@ -63,55 +49,12 @@ impl DescriptorMapping {
     }
 
     /// Fetch descriptor mapping from remote registry.
-    pub async fn fetch_from_registry(
-        &self,
-        url: &str,
-        ts: Option<i64>,
-    ) -> anyhow::Result<Option<i64>> {
-        let url = if let Some(ts) = ts {
-            format!("{}/api/v1/descriptors?ts={}", url.trim_end_matches("/"), ts)
-        } else {
-            format!("{}/api/v1/descriptors", url.trim_end_matches("/"))
-        };
-
-        let resp = reqwest::get(url).await?;
-
-        match resp.status() {
-            StatusCode::NOT_FOUND => Ok(None),
-            StatusCode::OK => {
-                let resp_bytes = resp.bytes().await?.to_vec();
-                let resp_body: FetchResponseBody = serde_json::from_slice(&resp_bytes)?;
-
-                let mut mapping = Vec::<(String, MessageDescriptor)>::new();
-
-                for d in resp_body.data {
-                    for file in d.files {
-                        let fdp = FileDescriptorProto::parse_from_bytes(&file)?;
-                        let fd = FileDescriptor::new_dynamic(fdp, &PROTO_DEPENDENCIES)?;
-                        for md in fd.messages() {
-                            let key = format!(
-                                "{}.{}.{}.{}",
-                                d.author,
-                                d.connector,
-                                d.version.replace(".", "_"),
-                                md.full_name().replace(".", "_")
-                            );
-                            mapping.push((key, md));
-                        }
-                    }
-                }
-
-                self.add_many(mapping);
-
-                Ok(Some(resp_body.last_updated))
-            }
-            _ => {
-                let status = resp.status();
-                let resp_bytes = resp.bytes().await?.to_vec();
-                let err_msg = String::from_utf8(resp_bytes)?;
-                return Err(anyhow!("({}) {}", status, err_msg));
-            }
+    pub async fn fetch_from_registry(&self, url: &str, ts: Option<i64>) -> anyhow::Result<()> {
+        if let Some(result) = fetch_from_registry(url, ts).await? {
+            self.add_many(result.mapping);
         }
+
+        Ok(())
     }
 
     /// Periodically synchronize mapping from remote registry.
@@ -124,32 +67,15 @@ impl DescriptorMapping {
         let (tx, mut rx) = mpsc::channel(1);
 
         tokio::spawn(async move {
-            let mut ts: Option<i64> = None;
-            let mut interval = tokio::time::interval(sync_interval);
+            let mut results = sync_from_registry(&url, sync_interval);
 
-            loop {
-                match this.fetch_from_registry(&url, ts).await {
-                    Err(err) => {
-                        tracing::error!("Failed to fetch descriptors from registry: {}", err)
-                    }
-                    Ok(last_updated) => {
-                        match last_updated {
-                            None => {
-                                tracing::debug!("Local descriptors are up-to-date with registry")
-                            }
-                            Some(last_updated) => {
-                                tracing::debug!("Successfully fetched descriptors from registry");
-                                ts = Some(last_updated);
-                            }
-                        };
-                        if !tx.is_closed() {
-                            let _ = tx.send(true).await;
-                            tx.closed().await;
-                        }
-                    }
-                };
+            while let Some(result) = results.recv().await {
+                this.add_many(result);
 
-                interval.tick().await;
+                if !tx.is_closed() {
+                    let _ = tx.send(true).await;
+                    tx.closed().await;
+                }
             }
         });
 
@@ -178,7 +104,7 @@ impl DescriptorMapping {
     pub fn add_many(&self, mds: Vec<(String, MessageDescriptor)>) {
         let mut mapping = self.mapping.write().unwrap();
         for (key, md) in mds {
-            tracing::info!("Add mapping: {} -> {}", key, md.full_name());
+            info!("Add mapping: {} -> {}", key, md.full_name());
             mapping.insert(key, Arc::new(md));
         }
     }
@@ -192,4 +118,122 @@ impl DescriptorMapping {
             Err(anyhow!("Key not found: {}", key))
         }
     }
+}
+
+#[derive(Deserialize)]
+struct FetchResponseBody {
+    last_updated: i64,
+    data: Vec<Descriptor>,
+}
+
+#[derive(Deserialize)]
+struct Descriptor {
+    author: String,
+    connector: String,
+    version: String,
+    #[serde(with = "base64a")]
+    files: Vec<Vec<u8>>,
+}
+
+pub struct FetchResult {
+    pub last_updated: i64,
+    pub mapping: Vec<(String, MessageDescriptor)>,
+}
+
+/// Fetch descriptor mapping from remote registry.
+pub async fn fetch_from_registry(
+    url: &str,
+    ts: Option<i64>,
+) -> anyhow::Result<Option<FetchResult>> {
+    let url = if let Some(ts) = ts {
+        format!("{}/api/v1/descriptors?ts={}", url.trim_end_matches("/"), ts)
+    } else {
+        format!("{}/api/v1/descriptors", url.trim_end_matches("/"))
+    };
+
+    let resp = reqwest::get(url).await?;
+
+    match resp.status() {
+        StatusCode::NOT_FOUND => Ok(None),
+        StatusCode::OK => {
+            let resp_bytes = resp.bytes().await?.to_vec();
+            let resp_body: FetchResponseBody = serde_json::from_slice(&resp_bytes)?;
+
+            let mut mapping = Vec::<(String, MessageDescriptor)>::new();
+
+            for d in resp_body.data {
+                for file in d.files {
+                    let fdp = FileDescriptorProto::parse_from_bytes(&file)?;
+                    let fd = FileDescriptor::new_dynamic(fdp, &PROTO_DEPENDENCIES)?;
+                    for md in fd.messages() {
+                        let key = format!(
+                            "{}.{}.{}.{}",
+                            d.author,
+                            d.connector,
+                            d.version.replace(".", "_"),
+                            md.full_name().replace(".", "_")
+                        );
+                        mapping.push((key, md));
+                    }
+                }
+            }
+
+            let result = FetchResult {
+                last_updated: resp_body.last_updated,
+                mapping,
+            };
+
+            Ok(Some(result))
+        }
+        _ => {
+            let status = resp.status();
+            let resp_bytes = resp.bytes().await?.to_vec();
+            let err_msg = String::from_utf8(resp_bytes)?;
+
+            Err(anyhow!("({}) {}", status, err_msg))
+        }
+    }
+}
+
+/// Periodically synchronize mapping from remote registry.
+pub fn sync_from_registry(
+    url: &str,
+    sync_interval: Duration,
+) -> mpsc::Receiver<Vec<(String, MessageDescriptor)>> {
+    let url = url.to_string();
+
+    let (tx, rx) = mpsc::channel(1);
+
+    tokio::spawn(async move {
+        let mut ts: Option<i64> = None;
+        let mut interval = tokio::time::interval(sync_interval);
+
+        loop {
+            match fetch_from_registry(&url, ts).await {
+                Err(err) => {
+                    error!("Failed to fetch descriptors from registry: {}", err)
+                }
+                Ok(result) => {
+                    match result {
+                        None => {
+                            debug!("Local descriptors are up-to-date with registry")
+                        }
+                        Some(result) => {
+                            debug!("Successfully fetched descriptors from registry");
+
+                            ts = Some(result.last_updated);
+
+                            if let Err(_) = tx.send(result.mapping).await {
+                                break;
+                            }
+                        }
+                    };
+                }
+            };
+
+            interval.tick().await;
+        }
+    });
+
+    rx
 }
