@@ -83,7 +83,10 @@ impl DescriptorMapping {
     }
 
     /// Return all keys.
-    pub fn keys(&self) -> Vec<String> {
+    pub fn keys<T>(&self) -> T
+    where
+        T: FromIterator<String>,
+    {
         let mapping = self.mapping.read().unwrap();
         mapping.keys().cloned().collect()
     }
