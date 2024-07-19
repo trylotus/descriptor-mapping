@@ -1,5 +1,8 @@
 mod utils;
 
+#[cfg(feature = "search")]
+use std::{collections::BTreeSet, ops::Bound};
+
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
@@ -30,12 +33,16 @@ static PROTO_DEPENDENCIES: Lazy<Vec<FileDescriptor>> = Lazy::new(|| {
 /// A mapping from string key to protobuf descriptor.
 pub struct DescriptorMapping {
     mapping: Arc<RwLock<HashMap<String, Arc<MessageDescriptor>>>>,
+    #[cfg(feature = "search")]
+    keys: Arc<RwLock<BTreeSet<String>>>,
 }
 
 impl Clone for DescriptorMapping {
     fn clone(&self) -> Self {
         Self {
             mapping: self.mapping.clone(),
+            #[cfg(feature = "search")]
+            keys: self.keys.clone(),
         }
     }
 }
@@ -43,8 +50,10 @@ impl Clone for DescriptorMapping {
 impl DescriptorMapping {
     /// Create a descriptor mapping.
     pub fn new() -> Self {
-        DescriptorMapping {
+        Self {
             mapping: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(feature = "search")]
+            keys: Arc::new(RwLock::new(BTreeSet::new())),
         }
     }
 
@@ -91,6 +100,12 @@ impl DescriptorMapping {
         mapping.keys().cloned().collect()
     }
 
+    /// Check if the given key exists.
+    pub fn contains_key(&self, key: &str) -> bool {
+        let mapping = self.mapping.read().unwrap();
+        mapping.contains_key(key)
+    }
+
     /// Get the descriptor for a given key.
     pub fn get(&self, key: &str) -> Option<Arc<MessageDescriptor>> {
         let mapping = self.mapping.read().unwrap();
@@ -99,12 +114,24 @@ impl DescriptorMapping {
 
     /// Add the descriptor for a given key.
     pub fn add(&self, key: String, md: MessageDescriptor) {
+        #[cfg(feature = "search")]
+        {
+            let mut keys = self.keys.write().unwrap();
+            keys.insert(key.clone());
+        }
         let mut mapping = self.mapping.write().unwrap();
         mapping.insert(key, Arc::new(md));
     }
 
     /// Add a list of key and descriptor pairs.
     pub fn add_many(&self, mds: Vec<(String, MessageDescriptor)>) {
+        #[cfg(feature = "search")]
+        {
+            let mut keys = self.keys.write().unwrap();
+            for (key, _) in mds.iter() {
+                keys.insert(key.clone());
+            }
+        }
         let mut mapping = self.mapping.write().unwrap();
         for (key, md) in mds {
             info!("Add mapping: {} -> {}", key, md.full_name());
@@ -120,6 +147,19 @@ impl DescriptorMapping {
         } else {
             Err(anyhow!("Key not found: {}", key))
         }
+    }
+
+    #[cfg(feature = "search")]
+    /// Find all keys that have the given prefix.
+    pub fn search_prefix<T>(&self, prefix: &str) -> T
+    where
+        T: FromIterator<String>,
+    {
+        let keys = self.keys.read().unwrap();
+        keys.range((Bound::Included(prefix.to_string()), Bound::Unbounded))
+            .take_while(|key| key.starts_with(prefix))
+            .cloned()
+            .collect()
     }
 }
 
